@@ -110,8 +110,8 @@ void FloatingUI::UpdateUITargetState()
 
     //Don't show UI if ImGui popup is open (which blocks all input so just hide this)
     //ImGui::IsPopupOpen() doesn't just check for modals though so it could get in the way at some point
-    if ( (ovrl_handle_hover_target == vr::k_ulOverlayHandleInvalid) && (vr::VROverlay()->GetPrimaryDashboardDevice() != vr::k_unTrackedDeviceIndexInvalid) &&
-         (!ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup)) )
+    const bool has_dashboard_device = (vr::VROverlay()->GetPrimaryDashboardDevice() != vr::k_unTrackedDeviceIndexInvalid);
+    if ( (ovrl_handle_hover_target == vr::k_ulOverlayHandleInvalid) && (!ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup)) )
     {
         for (unsigned int i = 1; i < OverlayManager::Get().GetOverlayCount(); ++i)
         {
@@ -123,9 +123,23 @@ void FloatingUI::UpdateUITargetState()
 
                 if (data.ConfigBool[configid_bool_overlay_floatingui_enabled])
                 {
-                    ovrl_handle_hover_target = ovrl_handle;
-                    ovrl_id_hover_target = i;
-                    break;
+                    bool is_interactive = true;
+
+                    //If there is no primary dashboard device, check if the overlay is interactive outside the dashboard
+                    //InteractiveIfVisible overlays usually cause a primary dashboard device to exist... but not always, so it's not reliable outside the actual dashboard
+                    if (!has_dashboard_device)
+                    {
+                        vr::VROverlay()->GetOverlayFlag(ovrl_handle, vr::VROverlayFlags_MakeOverlaysInteractiveIfVisible, &is_interactive);
+                    }
+
+                    if (is_interactive)
+                    {
+                        ovrl_handle_hover_target = ovrl_handle;
+                        ovrl_id_hover_target = i;
+
+                        vr::VROverlay()->SetOverlayFlag(ovrl_handle_floating_ui, vr::VROverlayFlags_MakeOverlaysInteractiveIfVisible, true);
+                        break;
+                    }
                 }
             }
         }
@@ -161,12 +175,31 @@ void FloatingUI::UpdateUITargetState()
         vr::VROverlay()->GetOverlayTextureBounds(m_OvrlHandleCurrentUITarget, &bounds);
 
 
-        int ovrl_pixel_width, ovrl_pixel_height;
-        ui_manager.GetOverlayPixelSize(ovrl_pixel_width, ovrl_pixel_height);
-
-        //Get 3D height factor
         const OverlayConfigData& data = OverlayManager::Get().GetConfigData(m_OvrlIDCurrentUITarget);
 
+        int ovrl_pixel_width, ovrl_pixel_height;
+
+        if (data.ConfigInt[configid_int_overlay_capture_source] == ovrl_capsource_desktop_duplication)
+        {
+            ui_manager.GetDesktopOverlayPixelSize(ovrl_pixel_width, ovrl_pixel_height);
+        }
+        else
+        {
+            vr::HmdVector2_t ovrl_mouse_scale;
+            //Use mouse scale of overlay if possible as it can sometimes differ from the config size (and GetOverlayTextureSize() currently leaks GPU memory, oops)
+            if (vr::VROverlay()->GetOverlayMouseScale(m_OvrlHandleCurrentUITarget, &ovrl_mouse_scale) == vr::VROverlayError_None)
+            {
+                ovrl_pixel_width  = (int)ovrl_mouse_scale.v[0];
+                ovrl_pixel_height = (int)ovrl_mouse_scale.v[1];
+            }
+            else
+            {
+                ovrl_pixel_width  = data.ConfigInt[configid_int_overlay_state_content_width];
+                ovrl_pixel_height = data.ConfigInt[configid_int_overlay_state_content_height];
+            }
+        }
+
+        //Get 3D height factor
         float height_factor_3d = 1.0f;
 
         if ( (data.ConfigInt[configid_int_overlay_3D_mode] == ovrl_3Dmode_sbs) )
@@ -219,6 +252,8 @@ void FloatingUI::UpdateUITargetState()
             //Hide
             m_Visible = false;
             m_FadeOutDelayCount = 0;
+
+            vr::VROverlay()->SetOverlayFlag(ovrl_handle_floating_ui, vr::VROverlayFlags_MakeOverlaysInteractiveIfVisible, false);
         }
     }
     else

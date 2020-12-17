@@ -5,22 +5,30 @@
 
 #include "Util.h"
 #include "OverlayManager.h"
+#include "InterprocessMessaging.h"
+#include "WindowList.h"
+#include "DesktopPlusWinRT.h"
+
+#ifndef DPLUS_UI
+    #include "WindowManager.h"
+#endif
 
 static ConfigManager g_ConfigManager;
 static const std::string g_EmptyString;       //This way we can still return a const reference. Worth it? iunno
 
 OverlayConfigData::OverlayConfigData()
 {
-    std::fill(std::begin(ConfigBool),  std::end(ConfigBool),  false);
-    std::fill(std::begin(ConfigInt),   std::end(ConfigInt),   -1);
-    std::fill(std::begin(ConfigFloat), std::end(ConfigFloat), 0.0f);
+    std::fill(std::begin(ConfigBool),   std::end(ConfigBool),   false);
+    std::fill(std::begin(ConfigInt),    std::end(ConfigInt),    -1);
+    std::fill(std::begin(ConfigFloat),  std::end(ConfigFloat),  0.0f);
+    std::fill(std::begin(ConfigIntPtr), std::end(ConfigIntPtr), 0);
 
     //Default the transform matrices to zero as an indicator to reset them when possible later
     float matrix_zero[16] = { 0.0f };
     std::fill(std::begin(ConfigDetachedTransform), std::end(ConfigDetachedTransform), matrix_zero);
 }
 
-ConfigManager::ConfigManager()
+ConfigManager::ConfigManager() : m_IsSteamInstall(false)
 {
     std::fill(std::begin(m_ConfigBool),  std::end(m_ConfigBool),  false);
     std::fill(std::begin(m_ConfigInt),   std::end(m_ConfigInt),   -1);
@@ -61,7 +69,15 @@ ConfigManager::ConfigManager()
         //We got the full executable path, so let's get the folder part
         std::size_t pos = path_str.find_last_of("\\");
         m_ApplicationPath = path_str.substr(0, pos + 1);	//Includes trailing backslash
-        m_ExecutableName = path_str.substr(pos + 1, std::string::npos);
+        m_ExecutableName  = path_str.substr(pos + 1, std::string::npos);
+
+        //Somewhat naive way to check if this install is from Steam without using Steam API or shipping different binaries
+        //Convert to lower first since there can be capitalization differences for the Steam directories
+        std::wstring path_wstr = buffer;
+        ::CharLowerBuff(buffer, (DWORD)path_wstr.length());
+        path_wstr = buffer;
+
+        m_IsSteamInstall = (path_wstr.find(L"\\steamapps\\common\\desktopplus\\desktopplus") != std::wstring::npos); 
     }
 
     delete[] buffer;
@@ -105,16 +121,20 @@ void ConfigManager::LoadOverlayProfile(const Ini& config, unsigned int overlay_i
     
     data.ConfigNameStr = config.ReadString(section.c_str(), "Name", default_name.c_str());
 
-    data.ConfigBool[configid_bool_overlay_enabled]                     = config.ReadBool(section.c_str(), "Enabled", true);
-    data.ConfigInt[configid_int_overlay_desktop_id]                    = config.ReadInt(section.c_str(),  "DesktopID", -2);
-    data.ConfigFloat[configid_float_overlay_width]                     = config.ReadInt(section.c_str(),  "Width", 350) / 100.0f;
-    data.ConfigFloat[configid_float_overlay_curvature]                 = config.ReadInt(section.c_str(),  "Curvature", -100) / 100.0f;
-    data.ConfigFloat[configid_float_overlay_opacity]                   = config.ReadInt(section.c_str(),  "Opacity", 100) / 100.0f;
-    data.ConfigFloat[configid_float_overlay_offset_right]              = config.ReadInt(section.c_str(),  "OffsetRight", 0) / 100.0f;
-    data.ConfigFloat[configid_float_overlay_offset_up]                 = config.ReadInt(section.c_str(),  "OffsetUp", 0) / 100.0f;
-    data.ConfigFloat[configid_float_overlay_offset_forward]            = config.ReadInt(section.c_str(),  "OffsetForward", 0) / 100.0f;
-    data.ConfigInt[configid_int_overlay_detached_display_mode]         = config.ReadInt(section.c_str(),  "DetachedDisplayMode", ovrl_dispmode_always);
-    data.ConfigInt[configid_int_overlay_detached_origin]               = config.ReadInt(section.c_str(),  "DetachedOrigin", ovrl_origin_room);
+    data.ConfigBool[configid_bool_overlay_enabled]                     = config.ReadBool(section.c_str(),   "Enabled", true);
+    data.ConfigInt[configid_int_overlay_desktop_id]                    = config.ReadInt(section.c_str(),    "DesktopID", -2);
+    data.ConfigInt[configid_int_overlay_capture_source]                = config.ReadInt(section.c_str(),    "CaptureSource", ovrl_capsource_desktop_duplication);
+    data.ConfigInt[configid_int_overlay_winrt_desktop_id]              = config.ReadInt(section.c_str(),    "WinRTDesktopID", -2);
+    data.ConfigStr[configid_str_overlay_winrt_last_window_title]       = config.ReadString(section.c_str(), "WinRTLastWindowTitle");
+    data.ConfigStr[configid_str_overlay_winrt_last_window_exe_name]    = config.ReadString(section.c_str(), "WinRTLastWindowExeName");
+    data.ConfigFloat[configid_float_overlay_width]                     = config.ReadInt(section.c_str(),    "Width", 350) / 100.0f;
+    data.ConfigFloat[configid_float_overlay_curvature]                 = config.ReadInt(section.c_str(),    "Curvature", 17) / 100.0f;
+    data.ConfigFloat[configid_float_overlay_opacity]                   = config.ReadInt(section.c_str(),    "Opacity", 100) / 100.0f;
+    data.ConfigFloat[configid_float_overlay_offset_right]              = config.ReadInt(section.c_str(),    "OffsetRight", 0) / 100.0f;
+    data.ConfigFloat[configid_float_overlay_offset_up]                 = config.ReadInt(section.c_str(),    "OffsetUp", 0) / 100.0f;
+    data.ConfigFloat[configid_float_overlay_offset_forward]            = config.ReadInt(section.c_str(),    "OffsetForward", 0) / 100.0f;
+    data.ConfigInt[configid_int_overlay_detached_display_mode]         = config.ReadInt(section.c_str(),    "DetachedDisplayMode", ovrl_dispmode_always);
+    data.ConfigInt[configid_int_overlay_detached_origin]               = config.ReadInt(section.c_str(),    "DetachedOrigin", ovrl_origin_room);
 
     data.ConfigInt[configid_int_overlay_crop_x]                        = config.ReadInt(section.c_str(),  "CroppingX", 0);
     data.ConfigInt[configid_int_overlay_crop_y]                        = config.ReadInt(section.c_str(),  "CroppingY", 0);
@@ -135,6 +155,13 @@ void ConfigManager::LoadOverlayProfile(const Ini& config, unsigned int overlay_i
     data.ConfigBool[configid_bool_overlay_floatingui_desktops_enabled] = config.ReadBool(section.c_str(), "ShowDesktopButtons", (current_id == k_ulOverlayID_Dashboard));
     data.ConfigBool[configid_bool_overlay_actionbar_enabled]           = config.ReadBool(section.c_str(), "ShowActionBar", false);
     data.ConfigBool[configid_bool_overlay_actionbar_order_use_global]  = config.ReadBool(section.c_str(), "ActionBarOrderUseGlobal", true);
+
+    //Restore WinRT Capture state if possible
+    if ( (data.ConfigInt[configid_int_overlay_winrt_desktop_id] == -2) && (!data.ConfigStr[configid_str_overlay_winrt_last_window_title].empty()) )
+    {
+        HWND window = WindowInfo::FindClosestWindowForTitle(data.ConfigStr[configid_str_overlay_winrt_last_window_title], data.ConfigStr[configid_str_overlay_winrt_last_window_exe_name]);
+        data.ConfigIntPtr[configid_intptr_overlay_state_winrt_hwnd] = (intptr_t)window;
+    }
 
     //Disable settings which are invalid for the dashboard overlay
     if (current_id == k_ulOverlayID_Dashboard)
@@ -211,6 +238,12 @@ void ConfigManager::LoadOverlayProfile(const Ini& config, unsigned int overlay_i
     {
         action_order = action_order_global;
     }
+
+    //Migrate now invalid curvature value
+    if (data.ConfigFloat[configid_float_overlay_curvature] == -1.0f)
+    {
+        data.ConfigFloat[configid_float_overlay_curvature] = 0.17f; //17% is about what the default dashboard curvature is at the default width
+    }
 }
 
 void ConfigManager::SaveOverlayProfile(Ini& config, unsigned int overlay_id)
@@ -235,6 +268,7 @@ void ConfigManager::SaveOverlayProfile(Ini& config, unsigned int overlay_id)
 
     config.WriteBool(section.c_str(), "Enabled",                data.ConfigBool[configid_bool_overlay_enabled]);
     config.WriteInt( section.c_str(), "DesktopID",              data.ConfigInt[configid_int_overlay_desktop_id]);
+    config.WriteInt( section.c_str(), "CaptureSource",          data.ConfigInt[configid_int_overlay_capture_source]);
     config.WriteInt( section.c_str(), "Width",              int(data.ConfigFloat[configid_float_overlay_width]           * 100.0f));
     config.WriteInt( section.c_str(), "Curvature",          int(data.ConfigFloat[configid_float_overlay_curvature]       * 100.0f));
     config.WriteInt( section.c_str(), "Opacity",            int(data.ConfigFloat[configid_float_overlay_opacity]         * 100.0f));
@@ -272,6 +306,28 @@ void ConfigManager::SaveOverlayProfile(Ini& config, unsigned int overlay_id)
     config.WriteString(section.c_str(), "DetachedTransformLeftHand",  data.ConfigDetachedTransform[ovrl_origin_left_hand].toString().c_str());
     config.WriteString(section.c_str(), "DetachedTransformAux",       data.ConfigDetachedTransform[ovrl_origin_aux].toString().c_str());
 
+    //Save WinRT Capture state
+    HWND window_handle = (HWND)data.ConfigIntPtr[configid_intptr_overlay_state_winrt_hwnd];
+    std::string last_window_title, last_window_exe_name;
+
+    if (window_handle != nullptr)
+    {
+        WindowInfo info(window_handle);
+        info.ExeName = WindowInfo::GetExeName(window_handle);
+
+        last_window_title    = StringConvertFromUTF16(info.Title.c_str());
+        last_window_exe_name = info.ExeName;
+    }
+    else //Save last known title and exe name even when handle is nullptr so we can still restore the window on the next load if it happens to exist
+    {
+        last_window_title    = data.ConfigStr[configid_str_overlay_winrt_last_window_title];
+        last_window_exe_name = data.ConfigStr[configid_str_overlay_winrt_last_window_exe_name];
+    }
+
+    config.WriteString(section.c_str(), "WinRTLastWindowTitle",   last_window_title.c_str());
+    config.WriteString(section.c_str(), "WinRTLastWindowExeName", last_window_exe_name.c_str());
+    config.WriteInt(section.c_str(), "WinRTDesktopID", data.ConfigInt[configid_int_overlay_winrt_desktop_id]);
+
     //Save action order
     std::stringstream ss;
 
@@ -288,6 +344,12 @@ bool ConfigManager::LoadConfigFromFile()
     std::wstring wpath = WStringConvertFromUTF8( std::string(m_ApplicationPath + "/config.ini").c_str() );
     bool existed = FileExists(wpath.c_str());
 
+    //If config.ini doesn't exist (yet), load from config_default.ini instead, which hopefully does (would still work to a lesser extent though)
+    if (!existed)
+    {
+        wpath = WStringConvertFromUTF8( std::string(m_ApplicationPath + "/config_default.ini").c_str() );
+    }
+
     Ini config(wpath.c_str());
 
     m_ConfigBool[configid_bool_interface_no_ui]                              = config.ReadBool("Interface", "NoUIAutoLaunch", false);
@@ -299,6 +361,7 @@ bool ConfigManager::LoadConfigFromFile()
     m_ConfigBool[configid_bool_interface_warning_compositor_res_hidden]      = config.ReadBool("Interface", "WarningCompositorResolutionHidden", false);
     m_ConfigBool[configid_bool_interface_warning_compositor_quality_hidden]  = config.ReadBool("Interface", "WarningCompositorQualityHidden", false);
     m_ConfigBool[configid_bool_interface_warning_process_elevation_hidden]   = config.ReadBool("Interface", "WarningProcessElevationHidden", false);
+    m_ConfigBool[configid_bool_interface_warning_elevated_mode_hidden]       = config.ReadBool("Interface", "WarningElevatedModeHidden", false);
     m_ConfigInt[configid_int_interface_wmr_ignore_vscreens]                  = config.ReadInt( "Interface", "WMRIgnoreVScreens", -1);
 
     OverlayManager::Get().SetCurrentOverlayID(m_ConfigInt[configid_int_interface_overlay_current_id]);
@@ -337,13 +400,20 @@ bool ConfigManager::LoadConfigFromFile()
     m_ConfigBool[configid_bool_input_keyboard_helper_enabled]          = config.ReadBool("Keyboard", "EnableKeyboardHelper", true);
     m_ConfigFloat[configid_float_input_keyboard_detached_size]         = config.ReadInt( "Keyboard", "KeyboardDetachedSize", 100) / 100.0f;
 
+    m_ConfigBool[configid_bool_windows_auto_focus_scene_app_dashboard] = config.ReadBool("Windows", "AutoFocusSceneAppDashboard", false);
+    m_ConfigBool[configid_bool_windows_winrt_auto_focus]               = config.ReadBool("Windows", "WinRTAutoFocus", true);
+    m_ConfigBool[configid_bool_windows_winrt_keep_on_screen]           = config.ReadBool("Windows", "WinRTKeepOnScreen", true);
+    m_ConfigInt[configid_int_windows_winrt_dragging_mode]              = config.ReadInt( "Windows", "WinRTDraggingMode", window_dragging_overlay);
+    m_ConfigBool[configid_bool_windows_winrt_auto_size_overlay]        = config.ReadBool("Windows", "WinRTAutoSizeOverlay", false);
+    m_ConfigBool[configid_bool_windows_winrt_auto_focus_scene_app]     = config.ReadBool("Windows", "WinRTAutoFocusSceneApp", false);
+
     m_ConfigInt[configid_int_performance_update_limit_mode]             = config.ReadInt( "Performance", "UpdateLimitMode", update_limit_mode_off);
     m_ConfigFloat[configid_float_performance_update_limit_ms]           = config.ReadInt( "Performance", "UpdateLimitMS", 0) / 100.0f;
     m_ConfigInt[configid_int_performance_update_limit_fps]              = config.ReadInt( "Performance", "UpdateLimitFPS", update_limit_fps_30);
     m_ConfigBool[configid_bool_performance_rapid_laser_pointer_updates] = config.ReadBool("Performance", "RapidLaserPointerUpdates", false);
     m_ConfigBool[configid_bool_performance_single_desktop_mirroring]    = config.ReadBool("Performance", "SingleDesktopMirroring", false);
 
-    m_ConfigBool[configid_bool_misc_auto_focus_scene_app]               = config.ReadBool("Misc", "AutoFocusSceneApp", false);
+    m_ConfigBool[configid_bool_misc_no_steam]                           = config.ReadBool("Misc", "NoSteam", false);
 
     //Load custom actions (this is where using ini feels dumb, but it still kinda works)
     auto& custom_actions = m_ActionManager.GetCustomActions();
@@ -462,6 +532,19 @@ bool ConfigManager::LoadConfigFromFile()
         m_ConfigInt[configid_int_input_shortcut03_action_id] = action_none;
     }
 
+    //Apply render cursor setting for WinRT Capture
+    #ifndef DPLUS_UI
+        if (DPWinRT_IsCaptureCursorEnabledPropertySupported())
+            DPWinRT_SetCaptureCursorEnabled(m_ConfigBool[configid_bool_input_mouse_render_cursor]);
+    #endif
+
+    #ifndef DPLUS_UI
+        WindowManager::Get().UpdateConfigState();
+    #endif
+
+    //Query elevated mode state
+    m_ConfigBool[configid_bool_state_misc_elevated_mode_active] = IPCManager::IsElevatedModeProcessRunning();
+
     //Load last used overlay config
     LoadMultiOverlayProfile(config);
     
@@ -564,6 +647,7 @@ void ConfigManager::SaveConfigToFile()
     config.WriteBool("Interface", "WarningCompositorResolutionHidden", m_ConfigBool[configid_bool_interface_warning_compositor_res_hidden]);
     config.WriteBool("Interface", "WarningCompositorQualityHidden",    m_ConfigBool[configid_bool_interface_warning_compositor_quality_hidden]);
     config.WriteBool("Interface", "WarningProcessElevationHidden",     m_ConfigBool[configid_bool_interface_warning_process_elevation_hidden]);
+    config.WriteBool("Interface", "WarningElevatedModeHidden",         m_ConfigBool[configid_bool_interface_warning_elevated_mode_hidden]);
 
     //Only write WMR settings when they're not -1 since they get set to that when using a non-WMR system. We want to preserve them for HMD-switching users
     if (m_ConfigInt[configid_int_interface_wmr_ignore_vscreens] != -1)
@@ -593,6 +677,13 @@ void ConfigManager::SaveConfigToFile()
 
     config.WriteBool("Keyboard", "EnableKeyboardHelper",        m_ConfigBool[configid_bool_input_keyboard_helper_enabled]);
     config.WriteInt( "Keyboard", "KeyboardDetachedSize",    int(m_ConfigFloat[configid_float_input_keyboard_detached_size] * 100.0f));
+
+    config.WriteBool("Windows", "AutoFocusSceneAppDashboard",   m_ConfigBool[configid_bool_windows_auto_focus_scene_app_dashboard]);
+    config.WriteBool("Windows", "WinRTAutoFocus",               m_ConfigBool[configid_bool_windows_winrt_auto_focus]);
+    config.WriteBool("Windows", "WinRTKeepOnScreen",            m_ConfigBool[configid_bool_windows_winrt_keep_on_screen]);
+    config.WriteInt( "Windows", "WinRTDraggingMode",            m_ConfigInt[configid_int_windows_winrt_dragging_mode]);
+    config.WriteBool("Windows", "WinRTAutoSizeOverlay",         m_ConfigBool[configid_bool_windows_winrt_auto_size_overlay]);
+    config.WriteBool("Windows", "WinRTAutoFocusSceneApp",       m_ConfigBool[configid_bool_windows_winrt_auto_focus_scene_app]);
     
     config.WriteInt( "Performance", "UpdateLimitMode",          m_ConfigInt[configid_int_performance_update_limit_mode]);
     config.WriteInt( "Performance", "UpdateLimitMS",        int(m_ConfigFloat[configid_float_performance_update_limit_ms] * 100.0f));
@@ -600,7 +691,7 @@ void ConfigManager::SaveConfigToFile()
     config.WriteBool("Performance", "RapidLaserPointerUpdates", m_ConfigBool[configid_bool_performance_rapid_laser_pointer_updates]);
     config.WriteBool("Performance", "SingleDesktopMirroring",   m_ConfigBool[configid_bool_performance_single_desktop_mirroring]);
 
-    config.WriteBool("Misc", "AutoFocusSceneApp",               m_ConfigBool[configid_bool_misc_auto_focus_scene_app]);
+    config.WriteBool("Misc", "NoSteam",                         m_ConfigBool[configid_bool_misc_no_steam]);
 
     //Save custom actions
     config.RemoveSection("CustomActions"); //Remove old section first to avoid any leftovers
@@ -761,6 +852,11 @@ WPARAM ConfigManager::GetWParamForConfigID(ConfigID_Float id)
     return id + configid_bool_MAX + configid_int_MAX;
 }
 
+WPARAM ConfigManager::GetWParamForConfigID(ConfigID_IntPtr id)
+{
+    return id + configid_bool_MAX + configid_int_MAX + configid_float_MAX;
+}
+
 void ConfigManager::SetConfigBool(ConfigID_Bool id, bool value)
 {
     if (id < configid_bool_overlay_MAX)
@@ -785,6 +881,11 @@ void ConfigManager::SetConfigFloat(ConfigID_Float id, float value)
         m_ConfigFloat[id] = value;
 }
 
+void ConfigManager::SetConfigIntPtr(ConfigID_IntPtr id, intptr_t value)
+{
+    OverlayManager::Get().GetCurrentConfigData().ConfigIntPtr[id] = value;
+}
+
 void ConfigManager::SetConfigString(ConfigID_String id, const std::string& value)
 {
     if (id < configid_str_MAX)
@@ -807,6 +908,11 @@ float ConfigManager::GetConfigFloat(ConfigID_Float id) const
     return (id < configid_float_overlay_MAX) ? OverlayManager::Get().GetCurrentConfigData().ConfigFloat[id] : m_ConfigFloat[id];
 }
 
+intptr_t ConfigManager::GetConfigIntPtr(ConfigID_IntPtr id) const
+{
+    return OverlayManager::Get().GetCurrentConfigData().ConfigIntPtr[id];
+}
+
 const std::string& ConfigManager::GetConfigString(ConfigID_String id) const
 {
     return m_ConfigString[id];
@@ -825,6 +931,11 @@ int& ConfigManager::GetConfigIntRef(ConfigID_Int id)
 float& ConfigManager::GetConfigFloatRef(ConfigID_Float id)
 {
     return (id < configid_float_overlay_MAX) ? OverlayManager::Get().GetCurrentConfigData().ConfigFloat[id] : m_ConfigFloat[id];
+}
+
+intptr_t& ConfigManager::GetConfigIntPtrRef(ConfigID_IntPtr id)
+{
+    return OverlayManager::Get().GetCurrentConfigData().ConfigIntPtr[id];
 }
 
 void ConfigManager::ResetConfigStateValues()
@@ -866,4 +977,9 @@ const std::string& ConfigManager::GetApplicationPath() const
 const std::string& ConfigManager::GetExecutableName() const
 {
 	return m_ExecutableName;
+}
+
+bool ConfigManager::IsSteamInstall() const
+{
+    return m_IsSteamInstall;
 }

@@ -9,6 +9,7 @@
 #include "ConfigManager.h"
 #include "OverlayManager.h"
 #include "Util.h"
+#include "WindowList.h"
 
 #include "WindowKeyboardHelper.h"
 
@@ -17,24 +18,26 @@ UIManager* g_UIManagerPtr = nullptr;
 
 void UIManager::DisplayDashboardAppError(const std::string& str) //Ideally this is never called
 {
+    //Hide UI overlay
     vr::VROverlay()->HideOverlay(m_OvrlHandle);
+    m_OvrlVisible = false;
+
+    //Hide all dashboard app overlays as well. Usually the dashboard app closes, but it may sometimes get stuck which could put its overlays in the way of the message overlay.
+    for (unsigned int i = k_ulOverlayID_Dashboard; i < OverlayManager::Get().GetOverlayCount(); ++i)
+    {
+        vr::VROverlayHandle_t ovrl_handle = OverlayManager::Get().FindOverlayHandle(i);
+
+        if (ovrl_handle != vr::k_ulOverlayHandleInvalid)
+        {
+            vr::VROverlay()->HideOverlay(ovrl_handle);
+        }
+    }
 
     vr::VRMessageOverlayResponse res = vr::VROverlay()->ShowMessageOverlay(str.c_str(), "Desktop+ Error", "Ok", "Restart Desktop+");
 
     if (res == vr::VRMessageOverlayResponse_ButtonPress_1)
     {
-        ConfigManager::Get().ResetConfigStateValues();
-        ConfigManager::Get().SaveConfigToFile();
-
-        STARTUPINFO si = {0};
-        PROCESS_INFORMATION pi = {0};
-        si.cb = sizeof(si);
-
-        ::CreateProcess(L"DesktopPlus.exe", nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi);
-
-        //We don't care about these, so close right away
-        ::CloseHandle(pi.hProcess);
-        ::CloseHandle(pi.hThread);
+        RestartDashboardApp();
     }
 
     //Dashboard will be closed after dismissing the message overlay, so open it back up with Desktop+
@@ -57,6 +60,7 @@ UIManager::UIManager(bool desktop_mode) : m_WindowHandle(nullptr),
                                           m_LowCompositorRes(false),
                                           m_LowCompositorQuality(false),
                                           m_OverlayErrorLast(vr::VROverlayError_None),
+                                          m_WinRTErrorLast(S_OK),
                                           m_ElevatedTaskSetUp(false),
                                           m_OvrlHandle(vr::k_ulOverlayHandleInvalid),
                                           m_OvrlHandleFloatingUI(vr::k_ulOverlayHandleInvalid),
@@ -106,6 +110,8 @@ vr::EVRInitError UIManager::InitOverlay()
 
     if (!vr::VROverlay())
         return vr::VRInitError_Init_InvalidInterface;
+
+    vr::VRApplications()->IdentifyApplication(::GetCurrentProcessId(), g_AppKeyUIApp);
 
     vr::VROverlayError ovrl_error = vr::VROverlayError_None;
 
@@ -198,7 +204,7 @@ vr::EVRInitError UIManager::InitOverlay()
     m_OpenVRLoaded = true;
     m_LowCompositorRes = (vr::VRSettings()->GetFloat("GpuSpeed", "gpuSpeedRenderTargetScale") < 1.0f);
 
-    UpdateOverlayPixelSize();
+    UpdateDesktopOverlayPixelSize();
 
     //Check if it's a WMR system and set up for that if needed
     SetConfigForWMR(ConfigManager::Get().GetConfigIntRef(configid_int_interface_wmr_ignore_vscreens));
@@ -272,7 +278,7 @@ void UIManager::HandleIPCMessage(const MSG& msg)
             {
                 case ipcact_resolution_update:
                 {
-                    UpdateOverlayPixelSize();
+                    UpdateDesktopOverlayPixelSize();
                     break;
                 }
                 case ipcact_vrkeyboard_closed:
@@ -283,6 +289,11 @@ void UIManager::HandleIPCMessage(const MSG& msg)
                 case ipcact_overlay_creation_error:
                 {
                     m_OverlayErrorLast = (vr::VROverlayError)msg.lParam;
+                    break;
+                }
+                case ipcact_winrt_thread_error:
+                {
+                    m_WinRTErrorLast = (HRESULT)msg.lParam;
                     break;
                 }
             }
@@ -315,6 +326,7 @@ void UIManager::HandleIPCMessage(const MSG& msg)
                     {
                         OverlayManager::Get().SetCurrentOverlayID((unsigned int)msg.lParam);
                         current_overlay_old = (unsigned int)msg.lParam;
+                        break;
                     }
                     default: break;
                 }
@@ -323,6 +335,26 @@ void UIManager::HandleIPCMessage(const MSG& msg)
             {
                 ConfigID_Float float_id = (ConfigID_Float)(msg.wParam - configid_bool_MAX - configid_int_MAX);
                 ConfigManager::Get().SetConfigFloat(float_id, *(float*)&msg.lParam);    //Interpret lParam as a float variable
+            }
+            else if (msg.wParam < configid_bool_MAX + configid_int_MAX + configid_float_MAX + configid_intptr_MAX)
+            {
+                ConfigID_IntPtr intptr_id = (ConfigID_IntPtr)(msg.wParam - configid_bool_MAX - configid_int_MAX - configid_float_MAX);
+                ConfigManager::Get().SetConfigIntPtr(intptr_id, msg.lParam);
+
+                switch (intptr_id)
+                {
+                    case configid_intptr_overlay_state_winrt_hwnd:
+                    {
+                        //Set last known title and exe name from new handle
+                        HWND window_handle = (HWND)msg.lParam;
+                        WindowInfo info(window_handle);
+                        info.ExeName = WindowInfo::GetExeName(window_handle);
+
+                        ConfigManager::Get().SetConfigString(configid_str_overlay_winrt_last_window_title,    StringConvertFromUTF16(info.Title.c_str()));
+                        ConfigManager::Get().SetConfigString(configid_str_overlay_winrt_last_window_exe_name, info.ExeName);
+                    }
+                    default: break;
+                }
             }
 
             //Restore overlay id override
@@ -342,15 +374,12 @@ void UIManager::OnExit()
     //This is likely more intuitive than just removing the UI entirely when clicking X
     if ( (m_DesktopMode) && (IPCManager::Get().IsDashboardAppRunning()) && (!ConfigManager::Get().GetConfigBool(configid_bool_interface_no_ui)) && (!m_NoRestartOnExit) )
     {
-        STARTUPINFO si = {0};
-        PROCESS_INFORMATION pi = {0};
-        si.cb = sizeof(si);
-
-        ::CreateProcess(L"DesktopPlusUI.exe", nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi);
-
-        //We don't care about these, so close right away
-        ::CloseHandle(pi.hProcess);
-        ::CloseHandle(pi.hThread);
+        Restart(false);
+    }
+    else
+    {
+        //Save config, just in case (we don't need to do this when calling Restart())
+        ConfigManager::Get().SaveConfigToFile();
     }
 }
 
@@ -420,6 +449,89 @@ void UIManager::DisableRestartOnExit()
     m_NoRestartOnExit = true;
 }
 
+void UIManager::Restart(bool desktop_mode)
+{
+    ConfigManager::Get().SaveConfigToFile();
+
+    UIManager::Get()->DisableRestartOnExit();
+
+    STARTUPINFO si = {0};
+    PROCESS_INFORMATION pi = {0};
+    si.cb = sizeof(si);
+
+    std::wstring path = WStringConvertFromUTF8(ConfigManager::Get().GetApplicationPath().c_str()) + L"DesktopPlusUI.exe";
+    WCHAR cmd[] = L"-DesktopMode";
+
+    ::CreateProcess(path.c_str(), (desktop_mode) ? cmd : nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi);
+
+    //We don't care about these, so close right away
+    ::CloseHandle(pi.hProcess);
+    ::CloseHandle(pi.hThread);
+}
+
+void UIManager::RestartDashboardApp(bool force_steam)
+{
+    ConfigManager::Get().ResetConfigStateValues();
+    ConfigManager::Get().SaveConfigToFile();
+
+    bool use_steam = ( (force_steam) || (ConfigManager::Get().GetConfigBool(configid_bool_state_misc_process_started_by_steam)) );
+
+    //LaunchDashboardOverlay() technically also launches the non-Steam version if it's registered, but there's no reason to use it in that case
+    if (use_steam)
+    {
+        //We need OpenVR loaded for this
+        if (!m_OpenVRLoaded)
+        {
+            InitOverlay();
+        }
+
+        //Steam will not launch the overlay if it's already running, so in this case we need to get rid of the running instance now
+        StopProcessByWindowClass(g_WindowClassNameDashboardApp);
+
+        ULONGLONG start_tick = ::GetTickCount64();
+        while ( (vr::VRApplications()->LaunchDashboardOverlay(g_AppKeyDashboardApp) == vr::VRApplicationError_ApplicationAlreadyRunning) && (::GetTickCount64() - start_tick < 3000) ) //Try 3 seconds max
+        {
+            ::Sleep(100);
+        }
+    }
+    else
+    {
+        STARTUPINFO si = {0};
+        PROCESS_INFORMATION pi = {0};
+        si.cb = sizeof(si);
+
+        std::wstring path = WStringConvertFromUTF8(ConfigManager::Get().GetApplicationPath().c_str()) + L"DesktopPlus.exe";
+        ::CreateProcess(path.c_str(), nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi);
+
+        //We don't care about these, so close right away
+        ::CloseHandle(pi.hProcess);
+        ::CloseHandle(pi.hThread);
+    }
+}
+
+void UIManager::ElevatedModeEnter()
+{
+    STARTUPINFO si = {0};
+    PROCESS_INFORMATION pi = {0};
+    si.cb = sizeof(si);
+
+    WCHAR cmd[] = L"\"schtasks\" /Run /TN \"DesktopPlus Elevated\""; //"CreateProcessW, can modify the contents of this string", so don't go optimize this away
+    ::CreateProcess(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+
+    //We don't care about these, so close right away
+    ::CloseHandle(pi.hProcess);
+    ::CloseHandle(pi.hThread);
+}
+
+void UIManager::ElevatedModeLeave()
+{
+    //Kindly ask elevated mode process to quit
+    if (HWND window = ::FindWindow(g_WindowClassNameElevatedMode, nullptr))
+    {
+        ::PostMessage(window, WM_QUIT, 0, 0);
+    }
+}
+
 void UIManager::SetUIScale(float scale)
 {
     m_UIScale = scale;
@@ -475,14 +587,61 @@ vr::EVROverlayError UIManager::GetOverlayErrorLast() const
     return m_OverlayErrorLast;
 }
 
+HRESULT UIManager::GetWinRTErrorLast() const
+{
+    return m_WinRTErrorLast;
+}
+
 void UIManager::ResetOverlayErrorLast()
 {
     m_OverlayErrorLast = vr::VROverlayError_None;
 }
 
+void UIManager::ResetWinRTErrorLast()
+{
+    m_WinRTErrorLast = S_OK;
+}
+
 bool UIManager::IsElevatedTaskSetUp() const
 {
     return m_ElevatedTaskSetUp;
+}
+
+void UIManager::TryChangingWindowFocus()
+{
+    //This is a non-exhaustive attempt to get a different window to set focus on, but it works in most cases
+    HWND window_top    = ::GetForegroundWindow();
+    HWND window_switch = nullptr;
+
+    //Just use a capturable window list as a base, it's about what we want here anyways
+    std::vector<WindowInfo> window_list = WindowInfo::CreateCapturableWindowList();
+    auto it = std::find_if(window_list.begin(), window_list.end(), [&](const auto& info){ return (info.WindowHandle == window_top); });
+
+    //Find the next window in that is not elevated
+    if (it != window_list.end())
+    {
+        for (++it; it != window_list.end(); ++it)
+        {
+            //Check if the window is also of an elevated process
+            DWORD process_id = 0;
+            ::GetWindowThreadProcessId(it->WindowHandle, &process_id);
+
+            if (!IsProcessElevated(process_id))
+            {
+                window_switch = it->WindowHandle;
+                break;
+            }
+        }
+    }
+
+    //If no window was found fall back
+    if (window_switch == nullptr)
+    {
+        //Focusing the desktop as last resort works but can be awkward since the focus is not obvious and keyboard input could do unintended stuff
+        window_switch = ::GetShellWindow(); 
+    }
+
+    ::SetForegroundWindow(window_switch); //I still do wonder why it is possible to switch away from elevated windows. Documentation says otherwise too.
 }
 
 bool UIManager::IsOverlayVisible() const
@@ -495,18 +654,17 @@ bool UIManager::IsOverlayKeyboardHelperVisible() const
     return m_OvrlVisibleKeyboardHelper;
 }
 
-void UIManager::GetOverlayPixelSize(int& width, int& height) const
+void UIManager::GetDesktopOverlayPixelSize(int& width, int& height) const
 {
-    width = m_OvrlPixelWidth;
+    width  = m_OvrlPixelWidth;
     height = m_OvrlPixelHeight;
 }
 
-void UIManager::UpdateOverlayPixelSize()
+void UIManager::UpdateDesktopOverlayPixelSize()
 {
     //If OpenVR was loaded, get it from the overlay
     if (m_OpenVRLoaded)
     {
-        //Looks confusing at first, but the dashboard overlay either has the mouse scale of the desktop every overlay is set to, or the combined desktop's
         vr::VROverlayHandle_t ovrl_handle_dplus = OverlayManager::Get().FindOverlayHandle(k_ulOverlayID_Dashboard);
 
         if (ovrl_handle_dplus != vr::k_ulOverlayHandleInvalid)
@@ -520,31 +678,14 @@ void UIManager::UpdateOverlayPixelSize()
     }
     else //What we get here may not reflect the real values, but let's do some good guesswork
     {
-        for (unsigned int i = 0; i < OverlayManager::Get().GetOverlayCount(); ++i)
-        {
-            OverlayConfigData& data = OverlayManager::Get().GetConfigData(i);
+        int& desktop_id = ConfigManager::Get().GetConfigIntRef(configid_int_overlay_desktop_id);
 
-            if (data.ConfigInt[configid_int_overlay_desktop_id] == -2)  //This should usually be handled by the dashboard app, but it's not here, so
-            {
-                data.ConfigInt[configid_int_overlay_desktop_id] = 0;
-                m_OvrlPixelWidth  = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-                m_OvrlPixelHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (desktop_id >= GetSystemMetrics(SM_CMONITORS))
+            desktop_id = -1;
+        else if (desktop_id == -2)  //-2 tell the dashboard application to crop it to desktop 0 and the value changes afterwards, though that doesn't happen when it's not running
+            desktop_id = 0;
 
-                DEVMODE mode = GetDevmodeForDisplayID(0);
-
-                if (mode.dmSize != 0)
-                {
-                    data.ConfigInt[configid_int_overlay_crop_x] = 0;
-                    data.ConfigInt[configid_int_overlay_crop_y] = 0;
-                    data.ConfigInt[configid_int_overlay_crop_width]  = mode.dmPelsWidth;
-                    data.ConfigInt[configid_int_overlay_crop_height] = mode.dmPelsHeight;
-                }
-            }
-        }
-
-        int desktop_id = OverlayManager::Get().GetConfigData(k_ulOverlayID_Dashboard).ConfigInt[configid_int_overlay_desktop_id];
-
-        if ( (desktop_id == -1) || (!ConfigManager::Get().GetConfigBool(configid_bool_performance_single_desktop_mirroring)) )  //All desktops, get virtual screen dimensions
+        if (desktop_id == -1)   //All desktops, get virtual screen dimensions
         {
             m_OvrlPixelWidth  = GetSystemMetrics(SM_CXVIRTUALSCREEN);
             m_OvrlPixelHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
@@ -586,32 +727,31 @@ void UIManager::PositionOverlay(WindowKeyboardHelper& window_kdbhelper)
         else
             distance_forward = 0.0f;
 
-        //Y offset probably dependent on UI overlay height. It's static, but something to keep in mind if it ever changes
-        //Z offset makes the UI stand a bit in front of the desktop overlay
-        OffsetTransformFromSelf(matrix, 0.0f, 0.75f, 0.025f + distance_forward);
-
         //Update Curvature
         float curve = config_data.ConfigFloat[configid_float_overlay_curvature];
 
-        if ( (curve == -1.0f) || (config_data.ConfigBool[configid_bool_overlay_detached]) ) //-1 is auto, match the dashboard (also do it when detached)
+        //Adjust curve value used for UI by the overlay width difference so it's curved according to its size
+        if (config_data.ConfigFloat[configid_float_overlay_width] >= 2.0f)
         {
-            vr::VROverlayHandle_t system_dashboard;
-            vr::VROverlay()->FindOverlay("system.systemui", &system_dashboard);
-
-            if (system_dashboard != vr::k_ulOverlayHandleInvalid)
-            {
-                vr::VROverlay()->GetOverlayCurvature(system_dashboard, &curve);
-            }
-            else //Very odd, but hey
-            {
-                curve = 0.0f;
-            }
-        }
-        else
-        {
-            //Adjust curve value used for UI by the overlay width difference so it's curved according to its size
             curve *= (2.75f / config_data.ConfigFloat[configid_float_overlay_width]);
+            curve = clamp(curve, 0.0f, 1.0f);
         }
+        else //Smaller than 2m can more easily curve into the UI overlay, adjust curve further
+        {
+            //For higher curve values, also move UI overlay forward a bit when needed, even if it doesn't look so nice
+            if ( (curve > 0.16f) && (dplus_forward > -0.1f) )
+            {
+                distance_forward += 0.1f;
+            }
+
+            curve *= 1.5f;
+            curve = clamp(curve, 0.0f, 1.0f);
+        }
+
+        //Offset the overlay
+        //Y offset probably dependent on UI overlay height. It's static, but something to keep in mind if it ever changes
+        //Z offset makes the UI stand a bit in front of the desktop overlay
+        OffsetTransformFromSelf(matrix, 0.0f, 0.75f, 0.025f + distance_forward);
 
         //Try to reduce flicker by blocking abrupt Y movements (unless X has changed as well, which we assume to happen on real movement)
         //The flicker itself comes from a race condition of the UI possibly getting the overlay transform while it's changing width and position, hard to predict

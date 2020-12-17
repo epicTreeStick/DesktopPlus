@@ -8,12 +8,17 @@
 #include <sstream>
 #include <system_error>
 
+#include <userenv.h>
+
+#include "DesktopPlusWinRT.h"
+
 #include "Util.h"
 #include "DisplayManager.h"
 #include "DuplicationManager.h"
 #include "OutputManager.h"
 #include "ThreadManager.h"
 #include "InterprocessMessaging.h"
+#include "ElevatedMode.h"
 
 // Below are lists of errors expect from Dxgi API calls when a transition event like mode change, PnpStop, PnpStart
 // desktop switch, TDR or session disconnect/reconnect. In all these cases we want the application to clean up the threads that process
@@ -54,8 +59,11 @@ HRESULT EnumOutputsExpectedErrors[] = {
 //
 // Forward Declarations
 //
-DWORD WINAPI DDProc(_In_ void* Param);
+DWORD WINAPI CaptureThreadEntry(_In_ void* Param);
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
+bool SpawnProcessWithDefaultEnv(LPCWSTR application_name, LPWSTR commandline = nullptr);
+void ProcessCmdline(bool& use_elevated_mode);
+
 //
 // Class for progressive waits
 //
@@ -145,15 +153,24 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
 
+    bool use_elevated_mode = false;
+    ProcessCmdline(use_elevated_mode);
+
+    if (use_elevated_mode)
+    {
+        //Pass all control to eleveated mode and exit when we're done there
+        return ElevatedModeEnter(hInstance);
+    }
+
     INT SingleOutput = 0;
 
     // Synchronization
-    HANDLE UnexpectedErrorEvent = nullptr;
-    HANDLE ExpectedErrorEvent = nullptr;
+    HANDLE UnexpectedErrorEvent   = nullptr;
+    HANDLE ExpectedErrorEvent     = nullptr;
     HANDLE NewFrameProcessedEvent = nullptr;
-    HANDLE PauseDuplicationEvent = nullptr;
+    HANDLE PauseDuplicationEvent  = nullptr;
     HANDLE ResumeDuplicationEvent = nullptr;
-    HANDLE TerminateThreadsEvent = nullptr;
+    HANDLE TerminateThreadsEvent  = nullptr;
 
     // Window
     HWND WindowHandle = nullptr;
@@ -244,6 +261,9 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
     //Allow IPC messages even when elevated
     IPCManager::Get().DisableUIPForRegisteredMessages(WindowHandle);
 
+    //Init WinRT DLL
+    DPWinRT_Init();
+
     THREADMANAGER ThreadMgr;
     OutputManager OutMgr(PauseDuplicationEvent, ResumeDuplicationEvent);
     RECT DeskBounds;
@@ -252,15 +272,8 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
     //Start up UI process unless disabled or already running
     if ( (!ConfigManager::Get().GetConfigBool(configid_bool_interface_no_ui)) && (!IPCManager::IsUIAppRunning()) )
     {
-        STARTUPINFO si = {0};
-        PROCESS_INFORMATION pi = {0};
-        si.cb = sizeof(si);
-
-        ::CreateProcess(L"DesktopPlusUI.exe", nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi);
-
-        //We don't care about these, so close right away
-        ::CloseHandle(pi.hProcess);
-        ::CloseHandle(pi.hThread);
+        std::wstring path = WStringConvertFromUTF8(ConfigManager::Get().GetApplicationPath().c_str()) + L"DesktopPlusUI.exe";
+        SpawnProcessWithDefaultEnv(path.c_str());
     }
 
     //Message loop
@@ -291,6 +304,10 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
                 {
                     SetEvent(ExpectedErrorEvent);
                 }
+            }
+            else if (msg.message >= WM_DPLUSWINRT) //WinRT library messages
+            {
+                OutMgr.HandleWinRTMessage(msg);
             }
             else
             {
@@ -342,6 +359,14 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
                         DisplayMsg(L"Failed to init OpenVR", L"Error", S_OK);
                     }
                     Ret = DUPL_RETURN_ERROR_UNEXPECTED;
+                    break;
+                }
+                else if ( (ConfigManager::Get().GetConfigBool(configid_bool_misc_no_steam)) && (ConfigManager::Get().GetConfigBool(configid_bool_state_misc_process_started_by_steam)) )
+                {
+                    //Was started by Steam but running through it was turned off, so restart without
+                    std::wstring path = WStringConvertFromUTF8(ConfigManager::Get().GetApplicationPath().c_str()) + L"DesktopPlus.exe";
+                    SpawnProcessWithDefaultEnv(path.c_str());
+
                     break;
                 }
             }
@@ -451,6 +476,10 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
     // Make sure all other threads have exited
     if (SetEvent(TerminateThreadsEvent))
     {
+        //Wake them up first if needed
+        ResetEvent(PauseDuplicationEvent);
+        SetEvent(ResumeDuplicationEvent);
+
         ThreadMgr.WaitForThreadTermination();
     }
 
@@ -461,6 +490,12 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
     CloseHandle(PauseDuplicationEvent);
     CloseHandle(ResumeDuplicationEvent);
     CloseHandle(TerminateThreadsEvent);
+
+    //Kindly ask elevated mode process to quit if it exists
+    if (HWND window = ::FindWindow(g_WindowClassNameElevatedMode, nullptr))
+    {
+        ::PostMessage(window, WM_QUIT, 0, 0);
+    }
 
     if (msg.message == WM_QUIT)
     {
@@ -531,10 +566,47 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     return 0;
 }
 
+bool SpawnProcessWithDefaultEnv(LPCWSTR application_name, LPWSTR commandline)
+{
+    LPVOID env = nullptr;
+    STARTUPINFO si = {0};
+    PROCESS_INFORMATION pi = {0};
+    si.cb = sizeof(si);
+
+    //Use a new environment block since we don't want to copy the Steam environment variables if there are any
+    if (::CreateEnvironmentBlock(&env, ::GetCurrentProcessToken(), FALSE))
+    {
+        bool ret = ::CreateProcess(application_name, commandline, nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT, env, nullptr, &si, &pi);
+
+        //We don't care about these, so close right away
+        ::CloseHandle(pi.hProcess);
+        ::CloseHandle(pi.hThread);
+
+        ::DestroyEnvironmentBlock(env);
+
+        return ret;
+    }
+
+    return false;
+}
+
+void ProcessCmdline(bool& use_elevated_mode)
+{
+    //__argv and __argc are global vars set by system
+    for (UINT i = 0; i < static_cast<UINT>(__argc); ++i)
+    {
+        if ((strcmp(__argv[i], "-ElevatedMode") == 0) ||
+            (strcmp(__argv[i], "/ElevatedMode") == 0))
+        {
+            use_elevated_mode = true;
+        }
+    }
+}
+
 //
 // Entry point for new duplication threads
 //
-DWORD WINAPI DDProc(_In_ void* Param)
+DWORD WINAPI CaptureThreadEntry(_In_ void* Param)
 {
     // Classes
     DISPLAYMANAGER DispMgr;

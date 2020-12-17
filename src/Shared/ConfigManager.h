@@ -36,25 +36,36 @@ enum ConfigID_Bool
     configid_bool_interface_warning_compositor_res_hidden,
     configid_bool_interface_warning_compositor_quality_hidden,
     configid_bool_interface_warning_process_elevation_hidden,
+    configid_bool_interface_warning_elevated_mode_hidden,
     configid_bool_performance_rapid_laser_pointer_updates,
     configid_bool_performance_single_desktop_mirroring,
     configid_bool_input_mouse_render_cursor,
     configid_bool_input_mouse_render_intersection_blob,
     configid_bool_input_mouse_hmd_pointer_override,
     configid_bool_input_keyboard_helper_enabled,
-    configid_bool_misc_auto_focus_scene_app,
+    configid_bool_windows_auto_focus_scene_app_dashboard,
+    configid_bool_windows_winrt_auto_focus,
+    configid_bool_windows_winrt_keep_on_screen,
+    configid_bool_windows_winrt_auto_size_overlay,
+    configid_bool_windows_winrt_auto_focus_scene_app,
+    configid_bool_misc_no_steam,                              //Restarts without Steam when it detects to have been launched by Steam
     configid_bool_state_overlay_dragmode,
     configid_bool_state_overlay_selectmode,
     configid_bool_state_overlay_dragselectmode_show_hidden,   //True if mode is from a popup
+    configid_bool_state_window_focused_process_elevated,
     configid_bool_state_performance_stats_active,             //Only count when the stats are visible
     configid_bool_state_performance_gpu_copy_active,
     configid_bool_state_misc_process_elevated,                //True if the dashboard application is running with admin privileges
+    configid_bool_state_misc_elevated_mode_active,            //True if the elevated mode process is running
+    configid_bool_state_misc_process_started_by_steam,
 	configid_bool_MAX
 };
 
 enum ConfigID_Int
 {
-    configid_int_overlay_desktop_id,                              //-1 is combined desktop, -2 is a default value that initializes crop to desktop 0
+    configid_int_overlay_desktop_id,                        //-1 is combined desktop, -2 is a default value that initializes crop to desktop 0
+    configid_int_overlay_capture_source,
+    configid_int_overlay_winrt_desktop_id,                  //-1 is combined desktop, -2 is unset
     configid_int_overlay_crop_x,
     configid_int_overlay_crop_y,
     configid_int_overlay_crop_width,
@@ -64,6 +75,8 @@ enum ConfigID_Int
     configid_int_overlay_detached_origin,
     configid_int_overlay_update_limit_override_mode,
     configid_int_overlay_update_limit_override_fps,
+    configid_int_overlay_state_content_width,
+    configid_int_overlay_state_content_height,
     configid_int_overlay_MAX,
     configid_int_interface_overlay_current_id,
     configid_int_interface_mainbar_desktop_listing,    
@@ -74,6 +87,7 @@ enum ConfigID_Int
     configid_int_input_shortcut02_action_id,
     configid_int_input_shortcut03_action_id,
     configid_int_input_mouse_dbl_click_assist_duration_ms,
+    configid_int_windows_winrt_dragging_mode,
     configid_int_performance_update_limit_mode,
     configid_int_performance_update_limit_fps,              //This is the enum ID, not the actual number. See ApplySettingUpdateLimiter() code for more info
     configid_int_state_overlay_current_id_override,         //This is used to send config changes to overlays which aren't the current, mainly to avoid the UI switching around (-1 is disabled)
@@ -105,17 +119,33 @@ enum ConfigID_Float
 	configid_float_MAX
 };
 
+enum ConfigID_IntPtr
+{
+    configid_intptr_overlay_state_winrt_hwnd,               //HWNDs are technically always in 32-bit range, but avoiding truncation warnings and perhaps some other issues here
+    configid_intptr_overlay_MAX,
+    configid_intptr_MAX = configid_intptr_overlay_MAX
+};
+
 enum ConfigID_String
 {
+    configid_str_overlay_winrt_last_window_title,
+    configid_str_overlay_winrt_last_window_exe_name,
+    configid_str_overlay_MAX,
     configid_str_state_detached_transform_current,
     configid_str_state_action_value_string,
-    configid_str_state_ui_keyboard_string,          //SteamVR keyboard input for the UI application
-    configid_str_state_dashboard_error_string,      //Error messages are displayed in VR through the UI app
-    configid_str_state_profile_name_load,           //Name of the profile to load 
+    configid_str_state_ui_keyboard_string,           //SteamVR keyboard input for the UI application
+    configid_str_state_dashboard_error_string,       //Error messages are displayed in VR through the UI app
+    configid_str_state_profile_name_load,            //Name of the profile to load 
 	configid_str_MAX
 };
 
 //Actually stored as ints, but still have this for readability
+enum OverlayCaptureSource
+{
+    ovrl_capsource_desktop_duplication,
+    ovrl_capsource_winrt_capture
+};
+
 enum Overlay3DMode
 {
     ovrl_3Dmode_none,
@@ -173,6 +203,13 @@ enum UpdateLimitFPS
     update_limit_fps_50
 };
 
+enum WindowDraggingMode
+{
+    window_dragging_none,
+    window_dragging_block,
+    window_dragging_overlay
+};
+
 class OverlayConfigData
 {
     public:
@@ -180,6 +217,8 @@ class OverlayConfigData
         bool ConfigBool[configid_bool_overlay_MAX];
         int ConfigInt[configid_int_overlay_MAX];
         float ConfigFloat[configid_float_overlay_MAX];
+        intptr_t ConfigIntPtr[configid_intptr_overlay_MAX];
+        std::string ConfigStr[configid_str_overlay_MAX];
         Matrix4 ConfigDetachedTransform[ovrl_origin_MAX];
         std::vector<ActionMainBarOrderData> ConfigActionBarOrder;
 
@@ -192,6 +231,7 @@ class ConfigManager
 		bool m_ConfigBool[configid_bool_MAX];
 		int m_ConfigInt[configid_int_MAX];
 		float m_ConfigFloat[configid_float_MAX];
+        //No m_ConfigIntPtr as so far it only contains overlay-specific data
 		std::string m_ConfigString[configid_str_MAX];
         Matrix4 m_ConfigOverlayDetachedTransform[ovrl_origin_MAX];
 
@@ -199,6 +239,7 @@ class ConfigManager
 
         std::string m_ApplicationPath;
         std::string m_ExecutableName;
+        bool m_IsSteamInstall;
 
         void LoadOverlayProfile(const Ini& config, unsigned int overlay_id = UINT_MAX);
         void SaveOverlayProfile(Ini& config, unsigned int overlay_id = UINT_MAX);
@@ -223,19 +264,23 @@ class ConfigManager
         static WPARAM GetWParamForConfigID(ConfigID_Bool id);
         static WPARAM GetWParamForConfigID(ConfigID_Int id);
         static WPARAM GetWParamForConfigID(ConfigID_Float id);
+        static WPARAM GetWParamForConfigID(ConfigID_IntPtr id);
 
         void SetConfigBool(ConfigID_Bool id, bool value);
         void SetConfigInt(ConfigID_Int id, int value);
         void SetConfigFloat(ConfigID_Float id, float value);
+        void SetConfigIntPtr(ConfigID_IntPtr id, intptr_t value);
         void SetConfigString(ConfigID_String id, const std::string& value);
         bool GetConfigBool(ConfigID_Bool id) const;
         int GetConfigInt(ConfigID_Int id) const;
         float GetConfigFloat(ConfigID_Float id) const;
+        intptr_t GetConfigIntPtr(ConfigID_IntPtr id) const;
         const std::string& GetConfigString(ConfigID_String id) const;
         //These are meant for direct use with ImGui widgets
         bool& GetConfigBoolRef(ConfigID_Bool id);
         int& GetConfigIntRef(ConfigID_Int id);
         float& GetConfigFloatRef(ConfigID_Float id);
+        intptr_t& GetConfigIntPtrRef(ConfigID_IntPtr id);
         void ResetConfigStateValues();  //Reset all configid_*_state_* settings. Used when restarting a Desktop+ process
 
         ActionManager& GetActionManager();
@@ -245,4 +290,5 @@ class ConfigManager
 
 		const std::string& GetApplicationPath() const;
 		const std::string& GetExecutableName() const;
+        bool IsSteamInstall() const;
 };
